@@ -677,25 +677,32 @@ impl ReadHalf {
     }
 
     let first_byte = self.buffer[0];
+    let second_byte = self.buffer[1];
     let fin = first_byte & 0b10000000 != 0;
     let rsv1 = first_byte & 0b01000000 != 0;
     let rsv2 = first_byte & 0b00100000 != 0;
     let rsv3 = first_byte & 0b00010000 != 0;
+    let opcode_bits = first_byte & 0b00001111;
+    let masked = second_byte & 0b10000000 != 0;
+    let payload_len_code = second_byte & 0x7F;
 
     if rsv1 || rsv2 || rsv3 {
       return Err(WebSocketError::ReservedBitsNotZero {
         rsv1,
         rsv2,
         rsv3,
-        header: first_byte,
+        first_byte,
+        second_byte,
+        fin,
+        opcode: opcode_bits,
+        masked,
+        payload_len_code,
       });
     }
 
-    let opcode = frame::OpCode::try_from(self.buffer[0] & 0b00001111)?;
-    let masked = self.buffer[1] & 0b10000000 != 0;
+    let opcode = frame::OpCode::try_from(opcode_bits)?;
 
-    let length_code = self.buffer[1] & 0x7F;
-    let extra = match length_code {
+    let extra = match payload_len_code {
       126 => 2,
       127 => 8,
       _ => 0,
@@ -707,7 +714,7 @@ impl ReadHalf {
     }
 
     let payload_len: usize = match extra {
-      0 => usize::from(length_code),
+      0 => usize::from(payload_len_code),
       2 => self.buffer.get_u16() as usize,
       #[cfg(any(target_pointer_width = "64", target_pointer_width = "128"))]
       8 => self.buffer.get_u64() as usize,

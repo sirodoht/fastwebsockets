@@ -22,12 +22,17 @@ pub enum WebSocketError {
   InvalidCloseCode,
   #[error("Unexpected EOF")]
   UnexpectedEOF,
-  #[error("Reserved bits must be zero; found rsv1={rsv1}, rsv2={rsv2}, rsv3={rsv3} in first header byte 0x{header:02X}")]
+  #[error("Reserved bits must be zero; found rsv1={rsv1}, rsv2={rsv2}, rsv3={rsv3} | Frame header: first_byte=0x{first_byte:02X} (binary: {first_byte:08b}), second_byte=0x{second_byte:02X} | Decoded: FIN={fin}, opcode={opcode}, masked={masked}, payload_len_code={payload_len_code}")]
   ReservedBitsNotZero {
     rsv1: bool,
     rsv2: bool,
     rsv3: bool,
-    header: u8,
+    first_byte: u8,
+    second_byte: u8,
+    fin: bool,
+    opcode: u8,
+    masked: bool,
+    payload_len_code: u8,
   },
   #[error("Control frame must not be fragmented")]
   ControlFrameFragmented,
