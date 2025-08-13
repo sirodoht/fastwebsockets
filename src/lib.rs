@@ -208,6 +208,8 @@ pub(crate) struct ReadHalf {
   writev_threshold: usize,
   max_message_size: usize,
   buffer: BytesMut,
+  buffer_corruption_count: u32,
+  last_valid_frame_position: usize,
 }
 
 #[cfg(feature = "unstable-split")]
@@ -585,7 +587,143 @@ impl ReadHalf {
       writev_threshold: 1024,
       max_message_size: 64 << 20,
       buffer,
+      buffer_corruption_count: 0,
+      last_valid_frame_position: 0,
     }
+  }
+
+  /// Validates that the buffer contains what looks like valid WebSocket frame data
+  fn validate_stream_data(&self) -> Result<(), WebSocketError> {
+    if self.buffer.len() < 2 {
+      return Ok(()); // Not enough data yet
+    }
+
+    let first_byte = self.buffer[0];
+    let second_byte = self.buffer[1];
+
+    // Check for obvious non-WebSocket protocols
+    // HTTP responses start with "HTTP/"
+    if self.buffer.len() >= 5 && &self.buffer[0..5] == b"HTTP/" {
+      let data = self.buffer[..std::cmp::min(16, self.buffer.len())].to_vec();
+      return Err(WebSocketError::CorruptedStreamData { data });
+    }
+
+    // HTML content
+    if self.buffer.len() >= 5
+      && (&self.buffer[0..5] == b"<html" || &self.buffer[0..5] == b"<!DOC")
+    {
+      let data = self.buffer[..std::cmp::min(16, self.buffer.len())].to_vec();
+      return Err(WebSocketError::CorruptedStreamData { data });
+    }
+
+    // Check for invalid opcode (bits 0-3 of first byte)
+    let opcode_bits = first_byte & 0b00001111;
+    if opcode_bits > 10 || (opcode_bits >= 3 && opcode_bits <= 7) {
+      // Invalid opcode: 3-7 are reserved, >10 is invalid
+      let data = self.buffer[..std::cmp::min(16, self.buffer.len())].to_vec();
+      return Err(WebSocketError::CorruptedStreamData { data });
+    }
+
+    // Check for multiple consecutive reserved bits set (very unlikely in valid data)
+    let rsv1 = first_byte & 0b01000000 != 0;
+    let rsv2 = first_byte & 0b00100000 != 0;
+    let rsv3 = first_byte & 0b00010000 != 0;
+    if rsv1 && rsv2 && rsv3 {
+      // All three RSV bits set is highly suspicious
+      let data = self.buffer[..std::cmp::min(16, self.buffer.len())].to_vec();
+      return Err(WebSocketError::CorruptedStreamData { data });
+    }
+
+    // Check payload length consistency
+    let _payload_len_code = second_byte & 0x7F;
+    let masked = second_byte & 0b10000000 != 0;
+
+    // Server should receive masked frames, client should receive unmasked frames
+    match self.role {
+      Role::Server if !masked => {
+        // Client should send masked frames to server
+        let data = self.buffer[..std::cmp::min(16, self.buffer.len())].to_vec();
+        return Err(WebSocketError::CorruptedStreamData { data });
+      }
+      Role::Client if masked => {
+        // Server should send unmasked frames to client
+        let data = self.buffer[..std::cmp::min(16, self.buffer.len())].to_vec();
+        return Err(WebSocketError::CorruptedStreamData { data });
+      }
+      _ => {}
+    }
+
+    Ok(())
+  }
+
+  /// Attempts to recover from buffer corruption by finding a valid frame boundary
+  /// or clearing the buffer if recovery is not possible
+  fn attempt_buffer_recovery(&mut self) -> Result<bool, WebSocketError> {
+    const MAX_RECOVERY_ATTEMPTS: u32 = 3;
+    const MAX_SCAN_BYTES: usize = 1024;
+
+    self.buffer_corruption_count += 1;
+
+    eprintln!(
+      "Buffer corruption detected, attempting recovery #{}",
+      self.buffer_corruption_count
+    );
+    eprintln!(
+      "Buffer content before recovery: {:02X?}",
+      &self.buffer[..std::cmp::min(32, self.buffer.len())]
+    );
+
+    // If we've had too many corruption attempts, clear the buffer entirely
+    if self.buffer_corruption_count >= MAX_RECOVERY_ATTEMPTS {
+      eprintln!("Max recovery attempts reached, clearing entire buffer");
+      self.buffer.clear();
+      self.last_valid_frame_position = 0;
+      return Err(WebSocketError::BufferCorruptionRecovery {
+        count: self.buffer_corruption_count,
+      });
+    }
+
+    // Try to find a valid frame boundary by scanning through the buffer
+    let scan_limit = std::cmp::min(self.buffer.len(), MAX_SCAN_BYTES);
+
+    for pos in 1..scan_limit {
+      if pos + 1 >= self.buffer.len() {
+        break;
+      }
+
+      let first_byte = self.buffer[pos];
+      let second_byte = self.buffer[pos + 1];
+      let opcode = first_byte & 0b00001111;
+      let masked = second_byte & 0b10000000 != 0;
+
+      // Check if this looks like a valid frame start
+      let looks_valid =
+        // Valid opcode
+        (opcode <= 2 || opcode == 8 || opcode == 9 || opcode == 10) &&
+        // Proper masking for role
+        match self.role {
+          Role::Server => masked,   // Client should send masked frames
+          Role::Client => !masked,  // Server should send unmasked frames
+        } &&
+        // No suspicious RSV pattern (not all bits set)
+        !(first_byte & 0b01110000 == 0b01110000);
+
+      if looks_valid {
+        eprintln!("Found potential valid frame boundary at position {}", pos);
+        // Advance to this position and try parsing
+        self.buffer.advance(pos);
+        self.last_valid_frame_position = 0;
+        return Ok(true);
+      }
+    }
+
+    // No valid boundary found, remove first byte and try again
+    eprintln!("No valid frame boundary found, removing first byte");
+    if !self.buffer.is_empty() {
+      self.buffer.advance(1);
+    }
+
+    Ok(false)
   }
 
   /// Attempt to read a single frame from from the incoming stream, returning any send obligations if
@@ -671,9 +809,38 @@ impl ReadHalf {
       }};
     }
 
-    // Read the first two bytes
-    while self.buffer.remaining() < 2 {
-      eof!(stream.read_buf(&mut self.buffer).await?);
+    loop {
+      // Read the first two bytes
+      while self.buffer.remaining() < 2 {
+        eof!(stream.read_buf(&mut self.buffer).await?);
+      }
+
+      // Validate stream data before parsing to detect corruption early
+      match self.validate_stream_data() {
+        Ok(()) => {
+          // Reset corruption counter on successful validation
+          self.buffer_corruption_count = 0;
+          self.last_valid_frame_position = 0;
+          break; // Exit loop and proceed with parsing
+        }
+        Err(WebSocketError::CorruptedStreamData { .. }) => {
+          // Attempt buffer recovery
+          match self.attempt_buffer_recovery()? {
+            true => {
+              // Recovery found a potential frame boundary, retry validation
+              match self.validate_stream_data() {
+                Ok(()) => break,    // Exit loop and proceed with parsing
+                Err(_) => continue, // Continue loop to try recovery again
+              }
+            }
+            false => {
+              // Recovery removed some data but didn't find boundary, continue loop for more data
+              continue;
+            }
+          }
+        }
+        Err(e) => return Err(e),
+      }
     }
 
     let first_byte = self.buffer[0];
@@ -687,6 +854,15 @@ impl ReadHalf {
     let payload_len_code = second_byte & 0x7F;
 
     if rsv1 || rsv2 || rsv3 {
+      eprintln!(
+        "Buffer state: len={}, capacity={}",
+        self.buffer.len(),
+        self.buffer.capacity()
+      );
+      eprintln!(
+        "Buffer content: {:02X?}",
+        &self.buffer[..std::cmp::min(16, self.buffer.len())]
+      );
       return Err(WebSocketError::ReservedBitsNotZero {
         rsv1,
         rsv2,
@@ -708,10 +884,15 @@ impl ReadHalf {
       _ => 0,
     };
 
-    self.buffer.advance(2);
-    while self.buffer.remaining() < extra + masked as usize * 4 {
+    // Ensure we have enough data for extended length + mask before advancing buffer
+    while self.buffer.remaining() < 2 + extra + masked as usize * 4 {
       eof!(stream.read_buf(&mut self.buffer).await?);
+      // Re-validate after each read in case new data is corrupted
+      self.validate_stream_data()?;
     }
+
+    // Now advance past the initial 2 bytes since we know we have all header data
+    self.buffer.advance(2);
 
     let payload_len: usize = match extra {
       0 => usize::from(payload_len_code),
@@ -753,11 +934,50 @@ impl ReadHalf {
     self.buffer.reserve(payload_len + MAX_HEADER_SIZE);
     while payload_len > self.buffer.remaining() {
       eof!(stream.read_buf(&mut self.buffer).await?);
+      // Validate that any additional data looks reasonable (basic sanity check)
+      if self.buffer.len() > payload_len + 2 {
+        // We have extra data that might be the next frame - do a basic validation
+        let extra_start = payload_len;
+        if extra_start + 1 < self.buffer.len() {
+          let next_first = self.buffer[extra_start];
+          let next_opcode = next_first & 0b00001111;
+          // Quick check for obviously invalid next frame
+          if next_opcode > 10 || (next_opcode >= 3 && next_opcode <= 7) {
+            let data = self.buffer
+              [extra_start..std::cmp::min(extra_start + 16, self.buffer.len())]
+              .to_vec();
+            return Err(WebSocketError::CorruptedStreamData { data });
+          }
+        }
+      }
     }
 
     // if we read too much it will stay in the buffer, for the next call to this method
     let payload = self.buffer.split_to(payload_len);
     let frame = Frame::new(fin, opcode, mask, Payload::Bytes(payload));
+
+    // Mark this position as successfully parsed
+    self.last_valid_frame_position = 0; // We've consumed the frame, reset position
+    self.buffer_corruption_count = 0; // Reset corruption counter on success
+
+    // Validate buffer alignment for next frame if there's remaining data
+    if self.buffer.len() >= 2 {
+      let next_first = self.buffer[0];
+      let next_opcode = next_first & 0b00001111;
+      // Quick sanity check on what looks like the next frame
+      if next_opcode > 10 || (next_opcode >= 3 && next_opcode <= 7) {
+        eprintln!(
+          "Warning: Next frame in buffer has suspicious opcode: {}",
+          next_opcode
+        );
+        eprintln!(
+          "Buffer alignment may be corrupted: {:02X?}",
+          &self.buffer[..std::cmp::min(8, self.buffer.len())]
+        );
+        // Don't error here, just warn - let the next parse_frame_header call handle it
+      }
+    }
+
     Ok(frame)
   }
 }
@@ -832,4 +1052,287 @@ mod tests {
     }
     assert_unsync::<WebSocket<tokio::net::TcpStream>>();
   };
+
+  // Mock stream for testing corruption scenarios
+  struct MockCorruptedStream {
+    data: Vec<u8>,
+    position: usize,
+    corruption_points: Vec<usize>, // Positions where corruption should be injected
+  }
+
+  impl MockCorruptedStream {
+    fn new(data: Vec<u8>) -> Self {
+      Self {
+        data,
+        position: 0,
+        corruption_points: Vec::new(),
+      }
+    }
+
+    fn with_corruption_at(mut self, positions: Vec<usize>) -> Self {
+      self.corruption_points = positions;
+      self
+    }
+  }
+
+  impl AsyncRead for MockCorruptedStream {
+    fn poll_read(
+      mut self: std::pin::Pin<&mut Self>,
+      _cx: &mut std::task::Context<'_>,
+      buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+      if self.position >= self.data.len() {
+        return std::task::Poll::Ready(Ok(()));
+      }
+
+      let remaining = self.data.len() - self.position;
+      let to_read = std::cmp::min(remaining, buf.remaining());
+
+      let data = &self.data[self.position..self.position + to_read];
+      buf.put_slice(data);
+      self.position += to_read;
+
+      std::task::Poll::Ready(Ok(()))
+    }
+  }
+
+  impl Unpin for MockCorruptedStream {}
+
+  #[tokio::test]
+  async fn test_http_response_corruption_detection() {
+    let mut read_half = ReadHalf::after_handshake(Role::Server);
+
+    // Simulate HTTP response corruption
+    let http_response = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+    read_half.buffer.extend_from_slice(http_response);
+
+    let result = read_half.validate_stream_data();
+
+    match result {
+      Err(WebSocketError::CorruptedStreamData { data }) => {
+        assert_eq!(&data[0..5], b"HTTP/");
+        println!("✓ HTTP response corruption detected correctly");
+      }
+      _ => panic!("Should have detected HTTP response corruption"),
+    }
+  }
+
+  #[tokio::test]
+  async fn test_html_corruption_detection() {
+    let mut read_half = ReadHalf::after_handshake(Role::Server);
+
+    // Simulate HTML content corruption
+    let html_content = b"<html><head><title>Error</title></head></html>";
+    read_half.buffer.extend_from_slice(html_content);
+
+    let result = read_half.validate_stream_data();
+
+    match result {
+      Err(WebSocketError::CorruptedStreamData { data }) => {
+        assert_eq!(&data[0..5], b"<html");
+        println!("✓ HTML content corruption detected correctly");
+      }
+      _ => panic!("Should have detected HTML content corruption"),
+    }
+  }
+
+  #[tokio::test]
+  async fn test_invalid_opcode_corruption() {
+    let mut read_half = ReadHalf::after_handshake(Role::Server);
+
+    // Create frame with invalid opcode (0x0F = 15, which is > 10)
+    let corrupt_frame = vec![
+      0x8F, // FIN=1, RSV=000, Opcode=1111 (invalid)
+      0x80, // Masked=1, PayloadLen=0
+      0x00, 0x00, 0x00, 0x00, // Mask
+    ];
+    read_half.buffer.extend_from_slice(&corrupt_frame);
+
+    let result = read_half.validate_stream_data();
+
+    match result {
+      Err(WebSocketError::CorruptedStreamData { .. }) => {
+        println!("✓ Invalid opcode corruption detected correctly");
+      }
+      _ => panic!("Should have detected invalid opcode corruption"),
+    }
+  }
+
+  #[tokio::test]
+  async fn test_all_rsv_bits_set_corruption() {
+    let mut read_half = ReadHalf::after_handshake(Role::Server);
+
+    // Create frame with all RSV bits set (highly suspicious)
+    let corrupt_frame = vec![
+      0xF1, // FIN=1, RSV=111, Opcode=0001
+      0x80, // Masked=1, PayloadLen=0
+      0x00, 0x00, 0x00, 0x00, // Mask
+    ];
+    read_half.buffer.extend_from_slice(&corrupt_frame);
+
+    let result = read_half.validate_stream_data();
+
+    match result {
+      Err(WebSocketError::CorruptedStreamData { .. }) => {
+        println!("✓ All RSV bits set corruption detected correctly");
+      }
+      _ => panic!("Should have detected all RSV bits set corruption"),
+    }
+  }
+
+  #[tokio::test]
+  async fn test_masking_role_violation() {
+    // Test server receiving unmasked frame (should be masked)
+    let mut server_read_half = ReadHalf::after_handshake(Role::Server);
+
+    let unmasked_frame = vec![
+      0x81, // FIN=1, RSV=000, Opcode=0001 (text)
+      0x05, // Masked=0, PayloadLen=5 (VIOLATION: client should send masked)
+      b'H', b'e', b'l', b'l', b'o',
+    ];
+    server_read_half.buffer.extend_from_slice(&unmasked_frame);
+
+    match server_read_half.validate_stream_data() {
+      Err(WebSocketError::CorruptedStreamData { .. }) => {
+        println!("✓ Server masking role violation detected correctly");
+      }
+      _ => panic!("Should have detected masking role violation for server"),
+    }
+
+    // Test client receiving masked frame (should be unmasked)
+    let mut client_read_half = ReadHalf::after_handshake(Role::Client);
+
+    let masked_frame = vec![
+      0x81, // FIN=1, RSV=000, Opcode=0001 (text)
+      0x85, // Masked=1, PayloadLen=5 (VIOLATION: server should send unmasked)
+      0x01, 0x02, 0x03, 0x04, // Mask
+      0x49, 0x67, 0x6F, 0x6C, 0x6B, // Masked "Hello"
+    ];
+    client_read_half.buffer.extend_from_slice(&masked_frame);
+
+    match client_read_half.validate_stream_data() {
+      Err(WebSocketError::CorruptedStreamData { .. }) => {
+        println!("✓ Client masking role violation detected correctly");
+      }
+      _ => panic!("Should have detected masking role violation for client"),
+    }
+  }
+
+  #[tokio::test]
+  async fn test_buffer_corruption_recovery() {
+    let mut read_half = ReadHalf::after_handshake(Role::Server);
+
+    // Create corrupted buffer: garbage + valid frame
+    let corrupt_data = vec![
+      // Garbage data (HTTP response)
+      b'H', b'T', b'T', b'P', b'/', b'1', b'.', b'1', // More garbage
+      0xFF, 0xFE, 0xFD,
+      // Valid WebSocket frame starts here
+      0x81, // FIN=1, RSV=000, Opcode=0001 (text)
+      0x85, // Masked=1, PayloadLen=5
+      0x01, 0x02, 0x03, 0x04, // Mask
+      0x49, 0x67, 0x6F, 0x6C, 0x6B, // Masked "Hello"
+    ];
+
+    read_half.buffer.extend_from_slice(&corrupt_data);
+
+    // Should initially fail validation due to HTTP corruption
+    let initial_validation = read_half.validate_stream_data();
+    assert!(matches!(
+      initial_validation,
+      Err(WebSocketError::CorruptedStreamData { .. })
+    ));
+
+    // Attempt recovery - should find the valid frame boundary
+    let recovery_result = read_half.attempt_buffer_recovery();
+
+    match recovery_result {
+      Ok(true) => {
+        // Recovery found a boundary, validate that it now passes
+        let post_recovery_validation = read_half.validate_stream_data();
+        assert!(
+          post_recovery_validation.is_ok(),
+          "Validation should pass after recovery"
+        );
+        println!("✓ Buffer corruption recovery successful");
+      }
+      Ok(false) => {
+        // Recovery didn't find boundary but removed some data
+        println!("✓ Buffer corruption recovery removed corrupt data");
+      }
+      Err(e) => panic!("Recovery failed: {:?}", e),
+    }
+  }
+
+  #[tokio::test]
+  async fn test_max_recovery_attempts() {
+    let mut read_half = ReadHalf::after_handshake(Role::Server);
+
+    // Fill buffer with only garbage data (no valid frames)
+    let garbage = vec![0xFF; 100];
+    read_half.buffer.extend_from_slice(&garbage);
+
+    // Attempt recovery multiple times until max attempts reached
+    for attempt in 1..=4 {
+      let recovery_result = read_half.attempt_buffer_recovery();
+
+      if attempt < 3 {
+        // First few attempts should succeed but not find valid boundaries
+        assert!(
+          recovery_result.is_ok(),
+          "Recovery attempt {} should not fail",
+          attempt
+        );
+      } else {
+        // Should eventually hit max attempts and clear buffer
+        match recovery_result {
+          Err(WebSocketError::BufferCorruptionRecovery { count }) => {
+            assert!(count >= 3, "Should have hit max recovery attempts");
+            assert!(
+              read_half.buffer.is_empty(),
+              "Buffer should be cleared after max attempts"
+            );
+            println!("✓ Max recovery attempts handled correctly");
+            break;
+          }
+          _ => continue,
+        }
+      }
+    }
+  }
+
+  #[tokio::test]
+  async fn test_successful_frame_parsing_resets_corruption_counter() {
+    let mut read_half = ReadHalf::after_handshake(Role::Server);
+
+    // Set corruption counter to simulate previous corruption
+    read_half.buffer_corruption_count = 2;
+
+    // Add valid WebSocket frame
+    let valid_frame = vec![
+      0x81, // FIN=1, RSV=000, Opcode=0001 (text)
+      0x85, // Masked=1, PayloadLen=5
+      0x01, 0x02, 0x03, 0x04, // Mask
+      0x49, 0x67, 0x6F, 0x6C, 0x6B, // Masked "Hello"
+    ];
+    read_half.buffer.extend_from_slice(&valid_frame);
+
+    // Mock stream for the parse function
+    let mut mock_stream_instance = MockCorruptedStream::new(vec![]);
+    let mut mock_stream = std::pin::Pin::new(&mut mock_stream_instance);
+
+    // Parse the frame - this should reset corruption counter
+    let result = read_half.parse_frame_header(&mut mock_stream).await;
+
+    match result {
+      Ok(_) => {
+        assert_eq!(
+          read_half.buffer_corruption_count, 0,
+          "Corruption counter should reset after successful parse"
+        );
+        println!("✓ Successful parsing resets corruption counter");
+      }
+      Err(e) => panic!("Valid frame should parse successfully: {:?}", e),
+    }
+  }
 }

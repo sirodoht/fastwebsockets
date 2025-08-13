@@ -44,6 +44,10 @@ pub enum WebSocketError {
   InvalidSecWebsocketVersion,
   #[error("Invalid value")]
   InvalidValue,
+  #[error("Corrupted stream data detected - not valid WebSocket protocol. First 16 bytes: {data:02X?}")]
+  CorruptedStreamData { data: Vec<u8> },
+  #[error("Buffer corruption detected - attempting recovery by clearing buffer. Corruption count: {count}")]
+  BufferCorruptionRecovery { count: u32 },
   #[error("Sec-WebSocket-Key header is missing")]
   MissingSecWebSocketKey,
   #[error(transparent)]
