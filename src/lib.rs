@@ -676,13 +676,19 @@ impl ReadHalf {
       eof!(stream.read_buf(&mut self.buffer).await?);
     }
 
-    let fin = self.buffer[0] & 0b10000000 != 0;
-    let rsv1 = self.buffer[0] & 0b01000000 != 0;
-    let rsv2 = self.buffer[0] & 0b00100000 != 0;
-    let rsv3 = self.buffer[0] & 0b00010000 != 0;
+    let first_byte = self.buffer[0];
+    let fin = first_byte & 0b10000000 != 0;
+    let rsv1 = first_byte & 0b01000000 != 0;
+    let rsv2 = first_byte & 0b00100000 != 0;
+    let rsv3 = first_byte & 0b00010000 != 0;
 
     if rsv1 || rsv2 || rsv3 {
-      return Err(WebSocketError::ReservedBitsNotZero);
+      return Err(WebSocketError::ReservedBitsNotZero {
+        rsv1,
+        rsv2,
+        rsv3,
+        header: first_byte,
+      });
     }
 
     let opcode = frame::OpCode::try_from(self.buffer[0] & 0b00001111)?;
